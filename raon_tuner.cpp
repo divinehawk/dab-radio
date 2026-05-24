@@ -99,11 +99,17 @@ bool RaonTunerInput::tunerPowerUp() {
 void RaonTunerInput::switchPage(RaonTunerInput::REGISTER_PAGE regPage) {
     std::vector<uint8_t> switchData{0x21, 0x00, 0x00, 0x02, 0x03, static_cast<uint8_t >(regPage)};
     int bytesTransfered = bulkTransferData(RAON_ENDPOINT_OUT, switchData);
+
+    std::vector<uint8_t> ack(1);
+    bulkTransferData(RAON_ENDPOINT_IN, ack);
 }
 
 void RaonTunerInput::setRegister(uint8_t reg, uint8_t val) {
     std::vector<uint8_t> setRegData{0x21, 0x00, 0x00, 0x02, reg, val};
     int bytesTransfered = bulkTransferData(RAON_ENDPOINT_OUT, setRegData);
+
+    std::vector<uint8_t> ack(1);
+    bulkTransferData(RAON_ENDPOINT_IN, ack);
 }
 
 uint8_t RaonTunerInput::readRegister(uint8_t reg) {
