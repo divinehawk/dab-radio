@@ -1,184 +1,171 @@
 /*
- * Copyright (C) 2018 IRT GmbH
- *
- * Author:
- *  Fabian Sattler
- *
- * This file is a part of IRT DAB library.
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
+    DABlin - capital DAB experience
+    Copyright (C) 2015-2024 Stefan Pöschel
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef DABPLUSSERVICECOMPONENTDECODER_H
-#define DABPLUSSERVICECOMPONENTDECODER_H
+#ifndef DABPLUS_DECODER_H_
+#define DABPLUS_DECODER_H_
 
-#include <vector>
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdexcept>
 #include <string>
-#include <atomic>
 
-#include <iostream>
+#if !(defined(DABLIN_AAC_FAAD2) ^ defined(DABLIN_AAC_FDKAAC))
+#error "You must select a AAC decoder by defining either DABLIN_AAC_FAAD2 or DABLIN_AAC_FDKAAC!"
+#endif
 
+#ifdef DABLIN_AAC_FAAD2
 
+#endif
 
-class DabPlusServiceComponentDecoder {
+#ifdef DABLIN_AAC_FDKAAC
+#include <fdk-aac/aacdecoder_lib.h>
+#endif
 
-public:
-    DabPlusServiceComponentDecoder();
-    virtual ~DabPlusServiceComponentDecoder();
-
-    virtual void setSubchannelBitrate(uint16_t bitrate);
-    virtual void componentDataInput(const std::vector<uint8_t>& frameData, bool synchronized);
-
-    //special case for MscStreamAudio
-    // using PAD_DATA_CALLBACK = std::function<void (const std::vector<uint8_t>&)>;
-    // virtual std::shared_ptr<PAD_DATA_CALLBACK> registerPadDataCallback(PAD_DATA_CALLBACK cb);
-
-    // using AUDIO_COMPONENT_DATA_CALLBACK = std::function<void(const std::vector<uint8_t>&, int, int, int, bool, bool)>;
-    // virtual std::shared_ptr<AUDIO_COMPONENT_DATA_CALLBACK> registerAudioDataCallback(AUDIO_COMPONENT_DATA_CALLBACK cb);
-
-private:
-    struct DabSuperFrame {
-        std::vector<uint8_t> superFrameData;
-        uint8_t numAUs{0};
-        std::vector<uint16_t> auLengths;
-        std::vector<uint16_t> auStarts;
-        bool sbrUsed{false};
-        bool psUsed{false};
-        int samplingRate{-1};
-        int channels{-1};
-        void clear() {superFrameData.clear(); numAUs = 0; auLengths.clear(); auStarts.clear(); sbrUsed = false; psUsed = false; samplingRate = -1; channels = -1;}
-    };
-
-private:
-    class RSDecoder {
-    private:
-        void *rs_handle;
-        uint8_t rs_packet[120];
-        int corr_pos[10];
-    public:
-        RSDecoder();
-        ~RSDecoder();
-
-        void DecodeSuperframe(uint8_t *sf, size_t sf_len);
-    };
-
-    RSDecoder m_rsDec;
-
-private:
-    const std::string m_logTag = "[DabPlusServiceComponentDecoder]";
-
-    DabSuperFrame m_currentSuperFrame;
-    bool m_isSync{false};
-    int m_dabSuperFrameCount{0};
-
-    uint16_t m_frameSize{0};
-    uint16_t m_superFrameSize{0};
-
-    // ConcurrentQueue <std::vector<uint8_t>> m_conQueue;
-    // CallbackDispatcher<std::function<void (const std::vector<uint8_t>&)>> m_padDataDispatcher;
-    // CallbackDispatcher<AUDIO_COMPONENT_DATA_CALLBACK> m_audioDataDispatcher;
-
-    // std::atomic<bool> m_processThreadRunning{false};
-    // std::thread m_processThread;
-
-    std::vector<uint8_t> m_unsyncDataBuffer;
-    bool m_unsyncSync{false};
-    int m_unsyncFrameCount{0};
-
-private:
-    void processData(const std::vector<uint8_t>& frameData);
-
-    void ProcessUntouchedStream(const uint8_t *data, size_t len);
-    void synchronizeData(const std::vector<uint8_t>& unsyncData);
-
-private:
-    static const uint16_t FIRECODE_TABLE[256];
-    static inline bool CHECK_FIRECODE(const uint8_t* frameData) {
-        uint16_t firstState = (frameData[2] << 8) | frameData[3];
-        uint16_t secState;
-
-        for(int16_t i = 4; i < 11; i++) {
-            secState = FIRECODE_TABLE[firstState >> 8];
-            firstState = (uint16_t)(((secState & 0x00ff) ^ frameData[i]) | ((secState ^ firstState << 8) & 0xff00));
-        }
-
-        for(int16_t i = 0; i < 2; i++) {
-            secState = FIRECODE_TABLE[firstState >> 8];
-            firstState = (uint16_t)(((secState & 0x00ff) ^ frameData[i]) | ((secState ^ firstState << 8) & 0xff00));
-        }
-
-        return firstState == 0;
-    }
-
-};
-
-
-static const uint16_t CRC_CCITT_TABLE[256] = {
-    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
-    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
-    0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
-    0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE,
-    0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485,
-    0xA56A, 0xB54B, 0x8528, 0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D,
-    0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4,
-    0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC,
-    0x48C4, 0x58E5, 0x6886, 0x78A7, 0x0840, 0x1861, 0x2802, 0x3823,
-    0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B,
-    0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12,
-    0xDBFD, 0xCBDC, 0xFBBF, 0xEB9E, 0x9B79, 0x8B58, 0xBB3B, 0xAB1A,
-    0x6CA6, 0x7C87, 0x4CE4, 0x5CC5, 0x2C22, 0x3C03, 0x0C60, 0x1C41,
-    0xEDAE, 0xFD8F, 0xCDEC, 0xDDCD, 0xAD2A, 0xBD0B, 0x8D68, 0x9D49,
-    0x7E97, 0x6EB6, 0x5ED5, 0x4EF4, 0x3E13, 0x2E32, 0x1E51, 0x0E70,
-    0xFF9F, 0xEFBE, 0xDFDD, 0xCFFC, 0xBF1B, 0xAF3A, 0x9F59, 0x8F78,
-    0x9188, 0x81A9, 0xB1CA, 0xA1EB, 0xD10C, 0xC12D, 0xF14E, 0xE16F,
-    0x1080, 0x00A1, 0x30C2, 0x20E3, 0x5004, 0x4025, 0x7046, 0x6067,
-    0x83B9, 0x9398, 0xA3FB, 0xB3DA, 0xC33D, 0xD31C, 0xE37F, 0xF35E,
-    0x02B1, 0x1290, 0x22F3, 0x32D2, 0x4235, 0x5214, 0x6277, 0x7256,
-    0xB5EA, 0xA5CB, 0x95A8, 0x8589, 0xF56E, 0xE54F, 0xD52C, 0xC50D,
-    0x34E2, 0x24C3, 0x14A0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
-    0xA7DB, 0xB7FA, 0x8799, 0x97B8, 0xE75F, 0xF77E, 0xC71D, 0xD73C,
-    0x26D3, 0x36F2, 0x0691, 0x16B0, 0x6657, 0x7676, 0x4615, 0x5634,
-    0xD94C, 0xC96D, 0xF90E, 0xE92F, 0x99C8, 0x89E9, 0xB98A, 0xA9AB,
-    0x5844, 0x4865, 0x7806, 0x6827, 0x18C0, 0x08E1, 0x3882, 0x28A3,
-    0xCB7D, 0xDB5C, 0xEB3F, 0xFB1E, 0x8BF9, 0x9BD8, 0xABBB, 0xBB9A,
-    0x4A75, 0x5A54, 0x6A37, 0x7A16, 0x0AF1, 0x1AD0, 0x2AB3, 0x3A92,
-    0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9,
-    0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
-    0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8,
-    0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
-};
-
-static inline bool CRC_CCITT_CHECK(const uint8_t* data, uint16_t dataLen) {
-    //initial register all 1
-    if(dataLen < 2) {
-        return false;
-    }
-
-    uint16_t crc = 0xffff;
-    uint16_t crc2 = 0xffff;
-
-    uint16_t crcVal, i;
-    uint8_t  crcCalData;
-
-    for (i = 0; i < (dataLen - 2); i++) {
-        crcCalData = *(data+i);
-        crc = (crc << 8)^CRC_CCITT_TABLE[(crc >> 8)^(crcCalData)++];
-    }
-
-    crcVal = *(data+i) << 8;
-    crcVal = crcVal | *(data+i+1);
-
-    crc2 = (crcVal^crc2);
-
-    return crc == crc2;
+extern "C" {
+#include "fec/fec.h"
 }
-#endif // DABPLUSSERVICECOMPONENTDECODER_H
+
+#include "subchannel_sink.h"
+#include "tools.h"
+
+
+struct SuperframeFormat {
+	bool dac_rate;
+	bool sbr_flag;
+	bool aac_channel_mode;
+	bool ps_flag;
+	int mpeg_surround_config;
+
+	int GetCoreSrIndex() {
+		return dac_rate ? (sbr_flag ? 6 : 3) : (sbr_flag ? 8 : 5);	// 24/48/16/32 kHz
+	}
+	int GetCoreChConfig() {
+		return aac_channel_mode ? 2 : 1;
+	}
+	int GetExtensionSrIndex() {
+		return dac_rate ? 3 : 5;	// 48/32 kHz
+	}
+	bool IsSBR() {
+		return sbr_flag;
+	}
+	size_t GetAULengthMs() {
+		return dac_rate ? (sbr_flag ? 40 : 20) : (sbr_flag ? 60 : 30);	// 24/48/16/32 kHz
+	}
+};
+
+
+// --- RSDecoder -----------------------------------------------------------------
+class RSDecoder {
+private:
+	void *rs_handle;
+	uint8_t rs_packet[120];
+	int corr_pos[10];
+public:
+	RSDecoder();
+	~RSDecoder();
+
+	void DecodeSuperframe(uint8_t *sf, size_t sf_len, int& total_corr_count, bool& uncorr_errors);
+};
+
+
+
+// --- AACDecoder -----------------------------------------------------------------
+class AACDecoder {
+protected:
+	SubchannelSinkObserver* observer;
+	uint8_t asc[7];
+	size_t asc_len;
+public:
+	AACDecoder(std::string decoder_name, SubchannelSinkObserver* observer, SuperframeFormat sf_format);
+	virtual ~AACDecoder() {}
+
+	virtual void DecodeFrame(uint8_t *data, size_t len) = 0;
+};
+
+
+#ifdef DABLIN_AAC_FAAD2
+// --- AACDecoderFAAD2 -----------------------------------------------------------------
+class AACDecoderFAAD2 : public AACDecoder {
+private:
+	NeAACDecHandle handle;
+	NeAACDecFrameInfo dec_frameinfo;
+public:
+	AACDecoderFAAD2(SubchannelSinkObserver* observer, SuperframeFormat sf_format);
+	~AACDecoderFAAD2();
+
+	void DecodeFrame(uint8_t *data, size_t len);
+};
+#endif
+
+
+#ifdef DABLIN_AAC_FDKAAC
+// --- AACDecoderFDKAAC -----------------------------------------------------------------
+class AACDecoderFDKAAC : public AACDecoder {
+private:
+	HANDLE_AACDECODER handle;
+	uint8_t *output_frame;
+	size_t output_frame_len;
+public:
+	AACDecoderFDKAAC(SubchannelSinkObserver* observer, SuperframeFormat sf_format);
+	~AACDecoderFDKAAC();
+
+	void DecodeFrame(uint8_t *data, size_t len);
+};
+#endif
+
+
+// --- SuperframeFilter -----------------------------------------------------------------
+class SuperframeFilter : public SubchannelSink {
+private:
+	bool decode_audio;
+
+	RSDecoder rs_dec;
+	AACDecoder *aac_dec;
+
+	size_t frame_len;
+	int frame_count;
+	int sync_frames;
+
+	uint8_t *sf_raw;
+	uint8_t *sf;
+	size_t sf_len;
+
+	bool sf_format_set;
+	uint8_t sf_format_raw;
+	SuperframeFormat sf_format;
+
+	int num_aus;
+	int au_start[6+1]; // +1 for end of last AU
+
+	BitWriter au_bw;
+
+	bool CheckSync();
+	void ProcessFormat();
+	void ProcessUntouchedStream(const uint8_t *data, size_t len);
+	void CheckForPAD(const uint8_t *data, size_t len);
+public:
+	SuperframeFilter(SubchannelSinkObserver* observer, bool decode_audio);
+	~SuperframeFilter();
+
+	void Feed(const uint8_t *data, size_t len);
+};
+
+
+
+#endif /* DABPLUS_DECODER_H_ */

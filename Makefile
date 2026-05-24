@@ -1,4 +1,4 @@
-CXXFLAGS=-std=c++11 -frtti -fexceptions
+CXXFLAGS=-std=c++11 -frtti -fexceptions -DDABLIN_AAC_FDKAAC
 SOURCES=$(wildcard *.cpp)
 FEC=$(wildcard fec/*.c)
 MAINS=dab_scan dab_mp2 dab_aac
@@ -11,9 +11,8 @@ all: clean $(MAINS)
 
 $(MAINS): $(COMMON_OBJECTS)
 	$(MAKE) $(@:=.o)
-	$(CXX) $(CXXFLAGS) $(LDFLAGS) $+ $@.o -o $@ -lusb-1.0
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) $+ $@.o -o $@ -lusb-1.0 -lfdk-aac
 
 clean:
 	$(RM) *.o
 	$(RM) $(MAINS)
-

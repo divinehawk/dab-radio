@@ -23,11 +23,11 @@
 
 #include <memory>
 #include <cstdint>
-#include <string>
 #include <array>
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <string>
 #include <vector>
 #include <libusb-1.0/libusb.h>
 
