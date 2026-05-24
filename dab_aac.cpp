@@ -16,11 +16,16 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <functional>
 #include "raon_tuner.h"
 #include "dabplus_decoder.h"
 #include "subchannel_sink.h"
 #include "tools.h"
 
+
+/* FEC callbacks set by main() after MscToSuperframe is constructed */
+static std::function<void()> g_on_fec_failure;
+static std::function<void()> g_on_fec_success;
 
 /* ── PCM observer ───────────────────────────────────────────────────────── */
 
@@ -43,8 +48,12 @@ public:
         fprintf(stderr, "[dab_aac] Audio warning: %s\n", hint.c_str());
     }
     void FECInfo(int c, bool uncorr) override {
-        if (uncorr)
+        if (uncorr) {
             fprintf(stderr, "[dab_aac] FEC: %d corrections, uncorrectable errors\n", c);
+            if (g_on_fec_failure) g_on_fec_failure();
+        } else {
+            if (g_on_fec_success) g_on_fec_success();
+        }
     }
 };
 
@@ -92,8 +101,12 @@ public:
         fprintf(stderr, "[dab_aac] Audio warning: %s\n", hint.c_str());
     }
     void FECInfo(int c, bool uncorr) override {
-        if (uncorr)
+        if (uncorr) {
             fprintf(stderr, "[dab_aac] FEC: %d corrections, uncorrectable errors\n", c);
+            if (g_on_fec_failure) g_on_fec_failure();
+        } else {
+            if (g_on_fec_success) g_on_fec_success();
+        }
     }
 
     void ProcessUntouchedStream(const uint8_t *data, size_t len, size_t /*duration_ms*/) override {
@@ -149,12 +162,35 @@ public:
     MscToSuperframe(int bitrate_kbps)
         : m_frame_size(bitrate_kbps * 3)
         , m_phase_locked(false)
+        , m_consec_failures(0)
     {
         fprintf(stderr, "[dab_aac] Frame size: %d bytes\n", m_frame_size);
     }
 
+    /* Called by SuperframeFilter via observer when RS decode fails.
+     * After too many consecutive failures we unlock phase and re-scan. */
+    void notifyFecFailure() {
+        m_consec_failures++;
+        /* 5 superframes = ~600ms of consecutive failures -> re-sync */
+        if (m_consec_failures >= 5 && m_phase_locked) {
+            fprintf(stderr, "[dab_aac] Phase lost — re-scanning\n");
+            m_phase_locked = false;
+            m_consec_failures = 0;
+            /* Don't clear the buffer — the fire code scan will find
+             * the new alignment within the existing buffered data. */
+        }
+    }
+
+    void notifyFecSuccess() {
+        m_consec_failures = 0;
+    }
+
     void mscData(const std::vector<uint8_t>& data) override {
         m_buf.insert(m_buf.end(), data.begin(), data.end());
+        /* Cap buffer to avoid unbounded growth during long signal loss */
+        const int max_buf = m_frame_size * 50;
+        if ((int)m_buf.size() > max_buf)
+            m_buf.erase(m_buf.begin(), m_buf.begin() + (m_buf.size() - max_buf));
         process();
     }
 
@@ -164,6 +200,7 @@ private:
             while ((int)m_buf.size() >= m_frame_size) {
                 if (check_firecode(m_buf.data())) {
                     m_phase_locked = true;
+                    m_consec_failures = 0;
                     fprintf(stderr, "[dab_aac] Frame phase locked\n");
                     break;
                 }
@@ -181,6 +218,7 @@ private:
 
     int                   m_frame_size;
     bool                  m_phase_locked;
+    int                   m_consec_failures;
     std::vector<uint8_t>  m_buf;
 };
 
@@ -225,6 +263,8 @@ int main(int argc, char *argv[]) {
 
     RaonTunerInput  *tuner   = new RaonTunerInput();
     MscToSuperframe *msc_obs = new MscToSuperframe(bitrate);
+    g_on_fec_failure = [msc_obs]{ msc_obs->notifyFecFailure(); };
+    g_on_fec_success = [msc_obs]{ msc_obs->notifyFecSuccess(); };
 
     tuner->initialize();
     tuner->tuneFrequency(atoi(argv[1]));
