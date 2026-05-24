@@ -23,6 +23,7 @@
 
 #include <memory>
 #include <cstdint>
+#include <string>
 #include <array>
 #include <functional>
 #include <thread>
