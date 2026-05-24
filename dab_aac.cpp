@@ -1,12 +1,14 @@
 /*
- * dab_aac - DAB+ receiver outputting raw s16le PCM to stdout
+ * dab_aac - DAB+ receiver outputting raw s16le PCM or ADTS AAC to stdout
  *
  * Uses dablin's SuperframeFilter + AACDecoderFDKAAC (TT_MP4_RAW).
  *
- * Usage:  dab_aac <frequency_hz> <subchannel_id> <bitrate_kbps>
+ * Usage:  dab_aac <frequency_hz> <subchannel_id> <bitrate_kbps> [-adts]
  * Example: dab_aac 218640000 1 72
+ *          dab_aac 218640000 1 72 -adts
  *
- * Output: raw signed 16-bit little-endian PCM to stdout
+ * Output: raw signed 16-bit little-endian PCM to stdout (default)
+ *         ADTS-framed AAC to stdout (with -adts)
  */
 
 #include <cstdio>
@@ -18,6 +20,7 @@
 #include "dabplus_decoder.h"
 #include "subchannel_sink.h"
 #include "tools.h"
+
 
 /* ── PCM observer ───────────────────────────────────────────────────────── */
 
@@ -43,6 +46,65 @@ public:
         if (uncorr)
             fprintf(stderr, "[dab_aac] FEC: %d corrections, uncorrectable errors\n", c);
     }
+};
+
+
+/* ── ADTS observer ──────────────────────────────────────────────────────── */
+/*
+ * Implements both SubchannelSinkObserver (to receive format/error callbacks
+ * from SuperframeFilter) and UntouchedStreamConsumer (to receive raw AU
+ * payloads).  For each AU it prepends a 7-byte ADTS header and writes the
+ * result to stdout.
+ *
+ * ADTS header (no-CRC variant, 7 bytes):
+ *   syncword          12  0xFFF
+ *   ID                 1  0 (MPEG-4)
+ *   layer              2  00
+ *   protection_absent  1  1 (no CRC)
+ *   profile            2  01 (AAC LC — object_type minus 1)
+ *   sampling_freq_idx  4  core SR index (see GetCoreSrIndex())
+ *   private_bit        1  0
+ *   channel_config     3  core channel config
+ *   originality/copy   2  00
+ *   frame_length      13  7 (header) + AU payload length in bytes
+ *   buffer_fullness   11  0x7FF (VBR)
+ *   aac_frame_count    2  00 (1 frame per ADTS frame)
+ *
+ * The core SR index (e.g. 6 → 24 kHz for a 48 kHz HE-AAC stream) is correct.
+ * The SBR/PS upsampling is signalled inside the AAC bitstream; the ADTS
+ * header only needs to describe the core layer.
+ *
+ */
+
+class AdtsObserver : public SubchannelSinkObserver, public UntouchedStreamConsumer {
+public:
+    AdtsObserver() : m_format_received(false) {}
+
+    void FormatChange(const AUDIO_SERVICE_FORMAT& fmt) override {
+        fprintf(stderr, "[dab_aac] Format: %s\n", fmt.GetSummary().c_str());
+        m_format_received = true;
+    }
+
+    void AudioError(const std::string& hint) override {
+        fprintf(stderr, "[dab_aac] Audio error: %s\n", hint.c_str());
+    }
+    void AudioWarning(const std::string& hint) override {
+        fprintf(stderr, "[dab_aac] Audio warning: %s\n", hint.c_str());
+    }
+    void FECInfo(int c, bool uncorr) override {
+        if (uncorr)
+            fprintf(stderr, "[dab_aac] FEC: %d corrections, uncorrectable errors\n", c);
+    }
+
+    void ProcessUntouchedStream(const uint8_t *data, size_t len, size_t /*duration_ms*/) override {
+        if (!m_format_received)
+            return;
+        fwrite(data, 1, len, stdout);
+        fflush(stdout);
+    }
+
+private:
+    bool m_format_received;
 };
 
 /* ── Fire code check (from IRT decoder) ─────────────────────────────────── */
@@ -79,12 +141,7 @@ static bool check_firecode(const uint8_t *frame) {
 }
 
 /* ── MSC observer with fire-code phase search ────────────────────────────── */
-/*
- * Buffers incoming bytes and searches for the frame phase by checking the
- * DAB+ fire code at each possible offset (0..frame_size-1). Once the fire
- * code passes at a given offset, that offset is locked and frames are fed
- * to SuperframeFilter at frame_size intervals from that point.
- */
+
 static SuperframeFilter *g_sf_filter = nullptr;
 
 class MscToSuperframe : public MscObserver {
@@ -104,26 +161,18 @@ public:
 private:
     void process() {
         if (!m_phase_locked) {
-            /* Scan for fire code at each possible frame boundary */
             while ((int)m_buf.size() >= m_frame_size) {
                 if (check_firecode(m_buf.data())) {
                     m_phase_locked = true;
                     fprintf(stderr, "[dab_aac] Frame phase locked\n");
                     break;
                 }
-                /* Try next byte offset */
                 m_buf.erase(m_buf.begin());
             }
         }
 
         if (m_phase_locked) {
             while ((int)m_buf.size() >= m_frame_size) {
-                /* Verify fire code still holds — if not, re-search */
-                if (!check_firecode(m_buf.data())) {
-                    /* Only check on what should be a superframe boundary
-                     * (every 5th frame) — single frame misses are ok */
-                    /* Just feed it anyway and let SuperframeFilter decide */
-                }
                 g_sf_filter->Feed(m_buf.data(), m_frame_size);
                 m_buf.erase(m_buf.begin(), m_buf.begin() + m_frame_size);
             }
@@ -135,27 +184,47 @@ private:
     std::vector<uint8_t>  m_buf;
 };
 
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <frequency_hz> <subchannel_id> <bitrate_kbps>\n"
+        "Usage: %s <frequency_hz> <subchannel_id> <bitrate_kbps> [-adts]\n"
         "  e.g: %s 218640000 1 72\n"
-        "Output: raw s16le PCM to stdout\n",
-        prog, prog);
+        "       %s 218640000 1 72 -adts\n"
+        "\n"
+        "Output modes:\n"
+        "  (default)  raw signed 16-bit little-endian PCM to stdout\n"
+        "  -adts      ADTS-framed AAC to stdout (no AAC decoding required)\n",
+        prog, prog, prog);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 4) { usage(argv[0]); return EXIT_FAILURE; }
+    if (argc < 4 || argc > 5) { usage(argv[0]); return EXIT_FAILURE; }
+
+    bool adts_mode = (argc == 5 && strcmp(argv[4], "-adts") == 0);
+    if (argc == 5 && !adts_mode) {
+        fprintf(stderr, "Unknown option: %s\n", argv[4]);
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
 
     init_firecode_table();
     int bitrate = atoi(argv[3]);
 
-    PcmObserver     *pcm_obs  = new PcmObserver();
-    g_sf_filter               = new SuperframeFilter(pcm_obs, true);
+    if (adts_mode) {
+        AdtsObserver *adts_obs = new AdtsObserver();
+        g_sf_filter = new SuperframeFilter(adts_obs, false /* decode_audio */);
+        g_sf_filter->AddUntouchedStreamConsumer(adts_obs);
+        fprintf(stderr, "[dab_aac] Output mode: ADTS\n");
+    } else {
+        PcmObserver *pcm_obs = new PcmObserver();
+        g_sf_filter = new SuperframeFilter(pcm_obs, true /* decode_audio */);
+        fprintf(stderr, "[dab_aac] Output mode: PCM\n");
+    }
 
-    RaonTunerInput  *tuner    = new RaonTunerInput();
-    MscToSuperframe *msc_obs  = new MscToSuperframe(bitrate);
+    RaonTunerInput  *tuner   = new RaonTunerInput();
+    MscToSuperframe *msc_obs = new MscToSuperframe(bitrate);
 
     tuner->initialize();
     tuner->tuneFrequency(atoi(argv[1]));

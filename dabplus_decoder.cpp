@@ -253,62 +253,31 @@ void SuperframeFilter::ProcessFormat() {
 	}
 }
 
-
 void SuperframeFilter::ProcessUntouchedStream(const uint8_t *data, size_t len) {
-	std::lock_guard<std::mutex> lock(uscs_mutex);
+    std::lock_guard<std::mutex> lock(uscs_mutex);
+    if(uscs.empty())
+        return;
 
-	if(uscs.empty())
-		return;
+    size_t frame_len = 7 + len;  // header + payload
 
-	au_bw.Reset();
+    uint8_t adts[7];
+    adts[0] = 0xFF;
+    adts[1] = 0xF1;  // ID=0 (MPEG-4), layer=00, no CRC
+    adts[2] = (0x01 << 6)                              // profile: AAC LC (01)
+            | (sf_format.GetCoreSrIndex() << 2)
+            | (sf_format.GetCoreChConfig() >> 2);
+    adts[3] = ((sf_format.GetCoreChConfig() & 0x3) << 6)
+            | ((frame_len >> 11) & 0x3);
+    adts[4] = (frame_len >> 3) & 0xFF;
+    adts[5] = ((frame_len & 0x7) << 5) | 0x1F;        // buffer fullness high 5 bits (0x7FF)
+    adts[6] = 0xFC;                                    // buffer fullness low 6 bits + 1 AAC frame
 
-	// AudioSyncStream()
-	au_bw.AddBits(0x2B7, 11);	// syncword
-	au_bw.AddBits(0, 13);		// audioMuxLengthBytes - written later
+    std::vector<uint8_t> adts_frame(frame_len);
+    memcpy(adts_frame.data(), adts, 7);
+    memcpy(adts_frame.data() + 7, data, len);
 
-	// AudioMuxElement(1)
-	au_bw.AddBits(0, 1);		// useSameStreamMux
-
-	// StreamMuxConfig()
-	au_bw.AddBits(0, 1);		// audioMuxVersion
-	au_bw.AddBits(1, 1);		// allStreamsSameTimeFraming
-	au_bw.AddBits(0, 6);		// numSubFrames
-	au_bw.AddBits(0, 4);		// numProgram
-	au_bw.AddBits(0, 3);		// numLayer
-
-	// AudioSpecificConfig() - PS signalling only implicit
-	if(sf_format.IsSBR()) {
-		au_bw.AddBits(0b00101, 5);							// SBR
-		au_bw.AddBits(sf_format.GetCoreSrIndex(), 4);		// samplingFrequencyIndex
-		au_bw.AddBits(sf_format.GetCoreChConfig(), 4);		// channelConfiguration
-		au_bw.AddBits(sf_format.GetExtensionSrIndex(), 4);	// extensionSamplingFrequencyIndex
-		au_bw.AddBits(0b00010, 5);							// AAC LC
-		au_bw.AddBits(0b100, 3);							// GASpecificConfig() with 960 transform
-	} else {
-		au_bw.AddBits(0b00010, 5);							// AAC LC
-		au_bw.AddBits(sf_format.GetCoreSrIndex(), 4);		// samplingFrequencyIndex
-		au_bw.AddBits(sf_format.GetCoreChConfig(), 4);		// channelConfiguration
-		au_bw.AddBits(0b100, 3);							// GASpecificConfig() with 960 transform
-	}
-
-	au_bw.AddBits(0b000, 3);	// frameLengthType
-	au_bw.AddBits(0xFF, 8);		// latmBufferFullness
-	au_bw.AddBits(0, 1);		// otherDataPresent
-	au_bw.AddBits(0, 1);		// crcCheckPresent
-
-	// PayloadLengthInfo()
-	for(size_t i = 0; i < len / 255; i++)
-		au_bw.AddBits(0xFF, 8);
-	au_bw.AddBits(len % 255, 8);
-
-	// PayloadMux()
-	au_bw.AddBytes(data, len);
-
-	// catch up on LATM frame len
-	au_bw.WriteAudioMuxLengthBytes();
-
-	const std::vector<uint8_t> latm_data = au_bw.GetData();
-	ForwardUntouchedStream(&latm_data[0], latm_data.size(), sf_format.GetAULengthMs());
+    // reuse the AU length timing from the original
+    ForwardUntouchedStream(adts_frame.data(), frame_len, sf_format.GetAULengthMs());
 }
 
 
