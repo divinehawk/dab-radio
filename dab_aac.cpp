@@ -3,12 +3,12 @@
  *
  * Uses dablin's SuperframeFilter + AACDecoderFDKAAC (TT_MP4_RAW).
  *
- * Usage:  dab_aac <frequency_hz> <subchannel_id> <bitrate_kbps> [-adts]
+ * Usage:  dab_aac <frequency_hz> <subchannel_id> <bitrate_kbps> [-adts] [-sls <dir>]
  * Example: dab_aac 218640000 1 72
- *          dab_aac 218640000 1 72 -adts
+ * dab_aac 218640000 1 72 -adts -sls /tmp/slideshow
  *
  * Output: raw signed 16-bit little-endian PCM to stdout (default)
- *         ADTS-framed AAC to stdout (with -adts)
+ * ADTS-framed AAC to stdout (with -adts)
  */
 
 #include <cstdio>
@@ -17,20 +17,105 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <fstream>
+#include <ctime>
+
 #include "raon_tuner.h"
 #include "dabplus_decoder.h"
 #include "subchannel_sink.h"
 #include "tools.h"
 
+// Include the DABlin PAD and MOT decoders
+#include "pad_decoder.h"
 
 /* FEC callbacks set by main() after MscToSuperframe is constructed */
 static std::function<void()> g_on_fec_failure;
 static std::function<void()> g_on_fec_success;
 
+/* ── SLS / PAD Observer ─────────────────────────────────────────────────── */
+
+class SlsExtractor : public PADDecoderObserver {
+private:
+    std::string m_output_dir;
+
+public:
+    SlsExtractor(const std::string& output_dir) : m_output_dir(output_dir) {}
+
+    // Triggered when a new MOT slide is fully reassembled
+    void PADChangeSlide(const MOT_FILE& slide) override {
+        if (m_output_dir.empty()) return;
+fprintf(stderr, "[dab_aac] Image received: %s\n", slide.content_name.c_str());
+    fprintf(stderr, "[dab_aac] Category: %s\n", slide.category_title.c_str());
+    fprintf(stderr, "[dab_aac] Click URL: %s\n", slide.click_through_url.c_str());
+
+	// Do not use broadcaster name
+        //std::string filename = slide.content_name;
+       	
+	std::string filename = "cover";
+        //    filename = "slide_" + std::to_string(std::time(nullptr));
+        if (slide.content_sub_type == MOT_FILE::CONTENT_SUB_TYPE_JFIF) filename += ".jpg";
+            else if (slide.content_sub_type == MOT_FILE::CONTENT_SUB_TYPE_PNG) filename += ".png";
+
+        // Basic filename sanitization to prevent directory traversal/errors
+        for (char& c : filename) { 
+            if (c == '/' || c == '\\') c = '_'; 
+        }
+
+        std::string filepath = m_output_dir + "/" + filename;
+        std::ofstream out(filepath, std::ios::binary);
+        
+        if (out) {
+            out.write(reinterpret_cast<const char*>(slide.data.data()), slide.data.size());
+            fprintf(stderr, "[dab_aac] Saved MOT slide: %s (%zu bytes)\n", filepath.c_str(), slide.data.size());
+        } else {
+            fprintf(stderr, "[dab_aac] Failed to save MOT slide: %s\n", filepath.c_str());
+        }
+    }
+
+    // Optional: Also catch the DLS (Dynamic Label Segment) radio text
+    void PADChangeDynamicLabel(const DL_STATE& dl) override {
+        std::string label = CharsetTools::ConvertTextToUTF8(dl.raw.data(), dl.raw.size(), dl.charset, false, nullptr);
+
+        std::ofstream json_file(m_output_dir + "/metadata.json");
+        if (json_file.is_open()) {
+            json_file << "{\n";
+            json_file << "  \"dls\": \"" << label << "\",\n";
+            json_file << "  \"dl_plus\": [\n";
+            
+            // Iterate through the dl_plus_objects vector defined in your pad_decoder.h
+            for (size_t i = 0; i < dl.dl_plus_objects.size(); ++i) {
+                const auto& obj = dl.dl_plus_objects[i];
+                
+                json_file << "    {\n";
+                // Use the decoder's built-in conversion helper
+                json_file << "      \"tag\": \"" << DynamicLabelDecoder::ConvertDLPlusContentTypeToString(obj.content_type) << "\",\n";
+                json_file << "      \"value\": \"" << obj.text << "\"\n";
+                json_file << "    }" << (i == dl.dl_plus_objects.size() - 1 ? "" : ",") << "\n";
+            }
+            
+            json_file << "  ]\n";
+            json_file << "}\n";
+            json_file.close();
+        }
+
+	fprintf(stderr, "[dab_aac] DLS: %s\n", label.c_str());
+    }
+    
+    void PADFileProgress(const double fraction) override {
+        // Optional: print progress for large files
+        // fprintf(stderr, "[dab_aac] MOT File Progress: %.0f%%\n", fraction * 100);
+    }
+};
+
 /* ── PCM observer ───────────────────────────────────────────────────────── */
 
 class PcmObserver : public SubchannelSinkObserver {
+private:
+    PADDecoder* m_pad_decoder;
+
 public:
+    PcmObserver(PADDecoder* pad_decoder = nullptr) : m_pad_decoder(pad_decoder) {}
+
     void StartAudio(int samplerate, int channels) override {
         fprintf(stderr, "[dab_aac] PCM: %d Hz, %d ch\n", samplerate, channels);
     }
@@ -55,39 +140,25 @@ public:
             if (g_on_fec_success) g_on_fec_success();
         }
     }
+    
+    // Pass extracted PAD data to the DABlin PADDecoder
+    void ProcessPAD(const uint8_t *xpad_data, size_t xpad_len, bool short_xpad, const uint8_t *fpad) override {
+        if (m_pad_decoder) {
+            m_pad_decoder->Process(xpad_data, xpad_len, short_xpad, fpad);
+        }
+    }
 };
 
 
 /* ── ADTS observer ──────────────────────────────────────────────────────── */
-/*
- * Implements both SubchannelSinkObserver (to receive format/error callbacks
- * from SuperframeFilter) and UntouchedStreamConsumer (to receive raw AU
- * payloads).  For each AU it prepends a 7-byte ADTS header and writes the
- * result to stdout.
- *
- * ADTS header (no-CRC variant, 7 bytes):
- *   syncword          12  0xFFF
- *   ID                 1  0 (MPEG-4)
- *   layer              2  00
- *   protection_absent  1  1 (no CRC)
- *   profile            2  01 (AAC LC — object_type minus 1)
- *   sampling_freq_idx  4  core SR index (see GetCoreSrIndex())
- *   private_bit        1  0
- *   channel_config     3  core channel config
- *   originality/copy   2  00
- *   frame_length      13  7 (header) + AU payload length in bytes
- *   buffer_fullness   11  0x7FF (VBR)
- *   aac_frame_count    2  00 (1 frame per ADTS frame)
- *
- * The core SR index (e.g. 6 → 24 kHz for a 48 kHz HE-AAC stream) is correct.
- * The SBR/PS upsampling is signalled inside the AAC bitstream; the ADTS
- * header only needs to describe the core layer.
- *
- */
 
 class AdtsObserver : public SubchannelSinkObserver, public UntouchedStreamConsumer {
+private:
+    bool m_format_received;
+    PADDecoder* m_pad_decoder;
+
 public:
-    AdtsObserver() : m_format_received(false) {}
+    AdtsObserver(PADDecoder* pad_decoder = nullptr) : m_format_received(false), m_pad_decoder(pad_decoder) {}
 
     void FormatChange(const AUDIO_SERVICE_FORMAT& fmt) override {
         fprintf(stderr, "[dab_aac] Format: %s\n", fmt.GetSummary().c_str());
@@ -116,16 +187,15 @@ public:
         fflush(stdout);
     }
 
-private:
-    bool m_format_received;
+    // Pass extracted PAD data to the DABlin PADDecoder
+    void ProcessPAD(const uint8_t *xpad_data, size_t xpad_len, bool short_xpad, const uint8_t *fpad) override {
+        if (m_pad_decoder) {
+            m_pad_decoder->Process(xpad_data, xpad_len, short_xpad, fpad);
+        }
+    }
 };
 
 /* ── Fire code check (from IRT decoder) ─────────────────────────────────── */
-/*
- * The fire code CRC covers bytes [2..10] of the first superframe frame,
- * with the result stored in bytes [0..1].
- * We use this to find correct frame phase before feeding SuperframeFilter.
- */
 static uint16_t FIRECODE_TABLE[256];
 
 static void init_firecode_table() {
@@ -167,17 +237,12 @@ public:
         fprintf(stderr, "[dab_aac] Frame size: %d bytes\n", m_frame_size);
     }
 
-    /* Called by SuperframeFilter via observer when RS decode fails.
-     * After too many consecutive failures we unlock phase and re-scan. */
     void notifyFecFailure() {
         m_consec_failures++;
-        /* 5 superframes = ~600ms of consecutive failures -> re-sync */
         if (m_consec_failures >= 5 && m_phase_locked) {
             fprintf(stderr, "[dab_aac] Phase lost — re-scanning\n");
             m_phase_locked = false;
             m_consec_failures = 0;
-            /* Don't clear the buffer — the fire code scan will find
-             * the new alignment within the existing buffered data. */
         }
     }
 
@@ -187,7 +252,6 @@ public:
 
     void mscData(const std::vector<uint8_t>& data) override {
         m_buf.insert(m_buf.end(), data.begin(), data.end());
-        /* Cap buffer to avoid unbounded growth during long signal loss */
         const int max_buf = m_frame_size * 50;
         if ((int)m_buf.size() > max_buf)
             m_buf.erase(m_buf.begin(), m_buf.begin() + (m_buf.size() - max_buf));
@@ -227,36 +291,60 @@ private:
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <frequency_hz> <subchannel_id> <bitrate_kbps> [-adts]\n"
+        "Usage: %s <frequency_hz> <subchannel_id> <bitrate_kbps> [-adts] [-sls <output_dir>]\n"
         "  e.g: %s 218640000 1 72\n"
-        "       %s 218640000 1 72 -adts\n"
+        "       %s 218640000 1 72 -adts -sls /tmp/slideshow\n"
         "\n"
         "Output modes:\n"
         "  (default)  raw signed 16-bit little-endian PCM to stdout\n"
-        "  -adts      ADTS-framed AAC to stdout (no AAC decoding required)\n",
+        "  -adts      ADTS-framed AAC to stdout (no AAC decoding required)\n"
+        "  -sls <dir> Extract MOT Slideshow images to the specified directory\n",
         prog, prog, prog);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 4 || argc > 5) { usage(argv[0]); return EXIT_FAILURE; }
+    if (argc < 4) { usage(argv[0]); return EXIT_FAILURE; }
 
-    bool adts_mode = (argc == 5 && strcmp(argv[4], "-adts") == 0);
-    if (argc == 5 && !adts_mode) {
-        fprintf(stderr, "Unknown option: %s\n", argv[4]);
-        usage(argv[0]);
-        return EXIT_FAILURE;
+    bool adts_mode = false;
+    std::string sls_dir = "";
+
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "-adts") == 0) {
+            adts_mode = true;
+        } else if (strcmp(argv[i], "-sls") == 0 && i + 1 < argc) {
+            sls_dir = argv[++i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
     }
 
     init_firecode_table();
     int bitrate = atoi(argv[3]);
 
+    SlsExtractor* sls_extractor = nullptr;
+    PADDecoder* pad_decoder = nullptr;
+
+    if (!sls_dir.empty()) {
+        fprintf(stderr, "[dab_aac] SLS Extraction enabled. Saving to: %s\n", sls_dir.c_str());
+        
+        sls_extractor = new SlsExtractor(sls_dir);
+        pad_decoder = new PADDecoder(sls_extractor, false); // 'false' for strict X-PAD length checking
+        
+        // CRITICAL: We must explicitly tell the PADDecoder the User Application Type for MOT.
+        // In the DAB standard, 12 is the type for MOT Slideshows. Without the FIC decoder running 
+        // to assign this dynamically, we have to force it.
+        pad_decoder->SetMOTAppType(12);
+    }
+
     if (adts_mode) {
-        AdtsObserver *adts_obs = new AdtsObserver();
+        AdtsObserver *adts_obs = new AdtsObserver(pad_decoder);
         g_sf_filter = new SuperframeFilter(adts_obs, false /* decode_audio */);
         g_sf_filter->AddUntouchedStreamConsumer(adts_obs);
         fprintf(stderr, "[dab_aac] Output mode: ADTS\n");
     } else {
-        PcmObserver *pcm_obs = new PcmObserver();
+        PcmObserver *pcm_obs = new PcmObserver(pad_decoder);
         g_sf_filter = new SuperframeFilter(pcm_obs, true /* decode_audio */);
         fprintf(stderr, "[dab_aac] Output mode: PCM\n");
     }
@@ -275,5 +363,8 @@ int main(int argc, char *argv[]) {
         tuner->readData();
 
     delete tuner;
+    delete pad_decoder;
+    delete sls_extractor;
+    
     return 0;
 }
