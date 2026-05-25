@@ -19,6 +19,7 @@
 #include <functional>
 #include <fstream>
 #include <ctime>
+#include <atomic>
 
 #include "raon_tuner.h"
 #include "dabplus_decoder.h"
@@ -31,6 +32,10 @@
 /* FEC callbacks set by main() after MscToSuperframe is constructed */
 static std::function<void()> g_on_fec_failure;
 static std::function<void()> g_on_fec_success;
+
+/* Mute flag: set when phase is lost, cleared when re-locked.
+ * Prevents ffmpeg from buffering stale audio during signal dropouts. */
+static std::atomic<bool> g_muted{false};
 
 /* ── SLS / PAD Observer ─────────────────────────────────────────────────── */
 
@@ -120,6 +125,7 @@ public:
         fprintf(stderr, "[dab_aac] PCM: %d Hz, %d ch\n", samplerate, channels);
     }
     void PutAudio(const uint8_t *data, size_t len) override {
+        if (g_muted) return;
         fwrite(data, 1, len, stdout);
         fflush(stdout);
     }
@@ -181,7 +187,7 @@ public:
     }
 
     void ProcessUntouchedStream(const uint8_t *data, size_t len, size_t /*duration_ms*/) override {
-        if (!m_format_received)
+        if (!m_format_received || g_muted)
             return;
         fwrite(data, 1, len, stdout);
         fflush(stdout);
@@ -243,6 +249,9 @@ public:
             fprintf(stderr, "[dab_aac] Phase lost — re-scanning\n");
             m_phase_locked = false;
             m_consec_failures = 0;
+            g_muted = true;
+            /* Flush stdout so ffmpeg sees the gap cleanly */
+            fflush(stdout);
         }
     }
 
@@ -265,6 +274,7 @@ private:
                 if (check_firecode(m_buf.data())) {
                     m_phase_locked = true;
                     m_consec_failures = 0;
+                    g_muted = false;
                     fprintf(stderr, "[dab_aac] Frame phase locked\n");
                     break;
                 }
