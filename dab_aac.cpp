@@ -19,7 +19,6 @@
 #include <functional>
 #include <fstream>
 #include <ctime>
-#include <atomic>
 
 #include "raon_tuner.h"
 #include "dabplus_decoder.h"
@@ -33,8 +32,8 @@
 static std::function<void()> g_on_fec_failure;
 static std::function<void()> g_on_fec_success;
 
-/* Mute flag: set when phase is lost, cleared when re-locked.
- * Prevents ffmpeg from buffering stale audio during signal dropouts. */
+/* Mute flag: stops audio output immediately on phase loss so ffmpeg sees
+ * a clean input gap rather than repeated/stale audio. Cleared on re-lock. */
 static std::atomic<bool> g_muted{false};
 
 /* ── SLS / PAD Observer ─────────────────────────────────────────────────── */
@@ -157,18 +156,119 @@ public:
 
 
 /* ── ADTS observer ──────────────────────────────────────────────────────── */
+/*
+ * Timestamp alignment via LATM silence injection:
+ *
+ * ADTS/LOAS streams have no wall-clock timestamps — ffmpeg generates PTS by
+ * counting frames.  When a DAB+ superframe has uncorrectable RS errors,
+ * SuperframeFilter calls FECInfo(uncorr=true) and skips ProcessUntouchedStream.
+ * This creates a gap of num_aus × AU_duration (typically 3 × 40ms = 120ms)
+ * in the output, causing ffmpeg's timestamp counter to fall behind real time.
+ *
+ * Fix: on each uncorrectable superframe, write num_aus LATM silence frames so
+ * ffmpeg's frame count (and therefore PTS) stays aligned with real time.
+ */
 
 class AdtsObserver : public SubchannelSinkObserver, public UntouchedStreamConsumer {
 private:
-    bool m_format_received;
+    bool m_format_received = false;
     PADDecoder* m_pad_decoder;
 
+    // Silence frame state — populated by FormatChange()
+    bool                 m_silence_ready = false;
+    int                  m_num_aus       = 3;
+    std::vector<uint8_t> m_silence_latm;
+
+    /* Build a minimal LATM/LOAS silence frame matching the current stream format.
+     * The frame carries a 4-byte null AAC payload which every decoder accepts
+     * as zero-energy audio, but ffmpeg with -c copy passes through without
+     * decoding, so only the LATM framing parameters matter for PTS accounting. */
+    void buildSilenceLatm(bool sbr, bool dac_rate, bool stereo) {
+        // Derive SuperframeFormat fields from AUDIO_SERVICE_FORMAT
+        int core_sr_idx = dac_rate ? (sbr ? 6 : 3) : (sbr ? 8 : 5);
+        int ext_sr_idx  = dac_rate ? 3 : 5;
+        int ch_cfg      = stereo ? 2 : 1;
+
+        // Number of AUs per superframe (from ETSI TS 102 563)
+        // dacRate=1,sbr=1 → 3  |  dacRate=1,sbr=0 → 5
+        // dacRate=0,sbr=1 → 4  |  dacRate=0,sbr=0 → 5
+        m_num_aus = dac_rate ? (sbr ? 3 : 5) : (sbr ? 4 : 5);
+
+        const uint8_t null_au[4] = {};
+        const size_t  au_len     = sizeof(null_au);
+
+        BitWriter bw;
+        bw.Reset();
+
+        // LOAS AudioSyncStream header
+        bw.AddBits(0x2B7, 11);   // syncword
+        bw.AddBits(0, 13);        // audioMuxLengthBytes (patched below)
+
+        // AudioMuxElement
+        bw.AddBits(0, 1);         // useSameStreamMux = 0 (always send StreamMuxConfig)
+
+        // StreamMuxConfig
+        bw.AddBits(0, 1);         // audioMuxVersion = 0
+        bw.AddBits(1, 1);         // allStreamsSameTimeFraming
+        bw.AddBits(0, 6);         // numSubFrames = 0
+        bw.AddBits(0, 4);         // numProgram = 0
+        bw.AddBits(0, 3);         // numLayer = 0
+
+        // AudioSpecificConfig (GASpecificConfig always 0b100 = 960-frame for DAB+)
+        if (sbr) {
+            bw.AddBits(5, 5);              // audioObjectType = SBR
+            bw.AddBits(core_sr_idx, 4);    // samplingFrequencyIndex (core)
+            bw.AddBits(ch_cfg, 4);         // channelConfiguration
+            bw.AddBits(ext_sr_idx, 4);     // extensionSamplingFrequencyIndex
+            bw.AddBits(2, 5);              // audioObjectType = AAC-LC
+            bw.AddBits(4, 3);              // GASpecificConfig: 960-frame
+        } else {
+            bw.AddBits(2, 5);              // audioObjectType = AAC-LC
+            bw.AddBits(core_sr_idx, 4);
+            bw.AddBits(ch_cfg, 4);
+            bw.AddBits(4, 3);              // GASpecificConfig: 960-frame
+        }
+
+        bw.AddBits(0, 3);         // frameLengthType = 0 (variable)
+        bw.AddBits(0xFF, 8);      // latmBufferFullness = 0xFF (VBR)
+        bw.AddBits(0, 1);         // otherDataPresent = 0
+        bw.AddBits(0, 1);         // crcCheckPresent = 0
+
+        // PayloadLengthInfo
+        for (size_t i = 0; i < au_len / 255; i++) bw.AddBits(0xFF, 8);
+        bw.AddBits((int)(au_len % 255), 8);
+
+        // PayloadMux (null bytes = silence)
+        bw.AddBytes(null_au, au_len);
+
+        bw.WriteAudioMuxLengthBytes();
+        m_silence_latm  = bw.GetData();
+        m_silence_ready = true;
+
+        fprintf(stderr, "[dab_aac] Silence LATM: %zu bytes/frame × %d AUs/superframe "
+                "(core_sr_idx=%d ext_sr_idx=%d ch=%d)\n",
+                m_silence_latm.size(), m_num_aus, core_sr_idx, ext_sr_idx, ch_cfg);
+    }
+
 public:
-    AdtsObserver(PADDecoder* pad_decoder = nullptr) : m_format_received(false), m_pad_decoder(pad_decoder) {}
+    AdtsObserver(PADDecoder* pad_decoder = nullptr)
+        : m_pad_decoder(pad_decoder) {}
+
+    /* Called by MscToSuperframe during phase-loss re-scan to keep timing aligned. */
+    void writeSilenceSuperframe() {
+        if (!m_silence_ready) return;
+        for (int i = 0; i < m_num_aus; i++)
+            fwrite(m_silence_latm.data(), 1, m_silence_latm.size(), stdout);
+        fflush(stdout);
+    }
 
     void FormatChange(const AUDIO_SERVICE_FORMAT& fmt) override {
         fprintf(stderr, "[dab_aac] Format: %s\n", fmt.GetSummary().c_str());
         m_format_received = true;
+        bool sbr      = (fmt.codec.find("HE-AAC") != std::string::npos);
+        bool dac_rate = (fmt.samplerate_khz == 48);
+        bool stereo   = (fmt.mode.find("Stereo") != std::string::npos);
+        buildSilenceLatm(sbr, dac_rate, stereo);
     }
 
     void AudioError(const std::string& hint) override {
@@ -177,9 +277,13 @@ public:
     void AudioWarning(const std::string& hint) override {
         fprintf(stderr, "[dab_aac] Audio warning: %s\n", hint.c_str());
     }
+
     void FECInfo(int c, bool uncorr) override {
         if (uncorr) {
             fprintf(stderr, "[dab_aac] FEC: %d corrections, uncorrectable errors\n", c);
+            /* Write silence to fill the gap this failed superframe creates,
+             * keeping ffmpeg's PTS counter aligned with real time. */
+            writeSilenceSuperframe();
             if (g_on_fec_failure) g_on_fec_failure();
         } else {
             if (g_on_fec_success) g_on_fec_success();
@@ -187,17 +291,14 @@ public:
     }
 
     void ProcessUntouchedStream(const uint8_t *data, size_t len, size_t /*duration_ms*/) override {
-        if (!m_format_received || g_muted)
-            return;
+        if (!m_format_received) return;
         fwrite(data, 1, len, stdout);
         fflush(stdout);
     }
 
-    // Pass extracted PAD data to the DABlin PADDecoder
     void ProcessPAD(const uint8_t *xpad_data, size_t xpad_len, bool short_xpad, const uint8_t *fpad) override {
-        if (m_pad_decoder) {
+        if (m_pad_decoder)
             m_pad_decoder->Process(xpad_data, xpad_len, short_xpad, fpad);
-        }
     }
 };
 
@@ -246,11 +347,10 @@ public:
     void notifyFecFailure() {
         m_consec_failures++;
         if (m_consec_failures >= 5 && m_phase_locked) {
-            fprintf(stderr, "[dab_aac] Phase lost — re-scanning\n");
+            fprintf(stderr, "[dab_aac] Phase lost — muting + re-scanning\n");
             m_phase_locked = false;
             m_consec_failures = 0;
             g_muted = true;
-            /* Flush stdout so ffmpeg sees the gap cleanly */
             fflush(stdout);
         }
     }
