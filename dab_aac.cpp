@@ -48,26 +48,23 @@ public:
     // Triggered when a new MOT slide is fully reassembled
     void PADChangeSlide(const MOT_FILE& slide) override {
         if (m_output_dir.empty()) return;
-fprintf(stderr, "[dab_aac] Image received: %s\n", slide.content_name.c_str());
-    fprintf(stderr, "[dab_aac] Category: %s\n", slide.category_title.c_str());
-    fprintf(stderr, "[dab_aac] Click URL: %s\n", slide.click_through_url.c_str());
+        fprintf(stderr, "[dab_aac] Image received: %s\n", slide.content_name.c_str());
+        fprintf(stderr, "[dab_aac] Category: %s\n", slide.category_title.c_str());
+        fprintf(stderr, "[dab_aac] Click URL: %s\n", slide.click_through_url.c_str());
 
-	// Do not use broadcaster name
-        //std::string filename = slide.content_name;
-       	
-	std::string filename = "cover";
-        //    filename = "slide_" + std::to_string(std::time(nullptr));
+        // Do not use broadcaster name
+        std::string filename = "cover";
         if (slide.content_sub_type == MOT_FILE::CONTENT_SUB_TYPE_JFIF) filename += ".jpg";
             else if (slide.content_sub_type == MOT_FILE::CONTENT_SUB_TYPE_PNG) filename += ".png";
 
         // Basic filename sanitization to prevent directory traversal/errors
-        for (char& c : filename) { 
-            if (c == '/' || c == '\\') c = '_'; 
+        for (char& c : filename) {
+            if (c == '/' || c == '\\') c = '_';
         }
 
         std::string filepath = m_output_dir + "/" + filename;
         std::ofstream out(filepath, std::ios::binary);
-        
+
         if (out) {
             out.write(reinterpret_cast<const char*>(slide.data.data()), slide.data.size());
             fprintf(stderr, "[dab_aac] Saved MOT slide: %s (%zu bytes)\n", filepath.c_str(), slide.data.size());
@@ -85,26 +82,24 @@ fprintf(stderr, "[dab_aac] Image received: %s\n", slide.content_name.c_str());
             json_file << "{\n";
             json_file << "  \"dls\": \"" << label << "\",\n";
             json_file << "  \"dl_plus\": [\n";
-            
-            // Iterate through the dl_plus_objects vector defined in your pad_decoder.h
+
             for (size_t i = 0; i < dl.dl_plus_objects.size(); ++i) {
                 const auto& obj = dl.dl_plus_objects[i];
-                
+
                 json_file << "    {\n";
-                // Use the decoder's built-in conversion helper
                 json_file << "      \"tag\": \"" << DynamicLabelDecoder::ConvertDLPlusContentTypeToString(obj.content_type) << "\",\n";
                 json_file << "      \"value\": \"" << obj.text << "\"\n";
                 json_file << "    }" << (i == dl.dl_plus_objects.size() - 1 ? "" : ",") << "\n";
             }
-            
+
             json_file << "  ]\n";
             json_file << "}\n";
             json_file.close();
         }
 
-	fprintf(stderr, "[dab_aac] DLS: %s\n", label.c_str());
+        fprintf(stderr, "[dab_aac] DLS: %s\n", label.c_str());
     }
-    
+
     void PADFileProgress(const double fraction) override {
         // Optional: print progress for large files
         // fprintf(stderr, "[dab_aac] MOT File Progress: %.0f%%\n", fraction * 100);
@@ -145,7 +140,7 @@ public:
             if (g_on_fec_success) g_on_fec_success();
         }
     }
-    
+
     // Pass extracted PAD data to the DABlin PADDecoder
     void ProcessPAD(const uint8_t *xpad_data, size_t xpad_len, bool short_xpad, const uint8_t *fpad) override {
         if (m_pad_decoder) {
@@ -157,16 +152,24 @@ public:
 
 /* ── ADTS observer ──────────────────────────────────────────────────────── */
 /*
- * Timestamp alignment via LATM silence injection:
+ * Timestamp alignment via ADTS silence injection:
  *
- * ADTS/LOAS streams have no wall-clock timestamps — ffmpeg generates PTS by
+ * ADTS streams have no wall-clock timestamps — ffmpeg generates PTS by
  * counting frames.  When a DAB+ superframe has uncorrectable RS errors,
  * SuperframeFilter calls FECInfo(uncorr=true) and skips ProcessUntouchedStream.
  * This creates a gap of num_aus × AU_duration (typically 3 × 40ms = 120ms)
  * in the output, causing ffmpeg's timestamp counter to fall behind real time.
  *
- * Fix: on each uncorrectable superframe, write num_aus LATM silence frames so
+ * Fix: on each uncorrectable superframe, write num_aus ADTS silence frames so
  * ffmpeg's frame count (and therefore PTS) stays aligned with real time.
+ *
+ * The silence frames use the same ADTS SR field as the real audio frames
+ * (core_sr_idx = 24kHz for HE-AAC with dac_rate=1), so ffmpeg computes all
+ * frames — real and silence — as 960/24000 = 40ms each.
+ *
+ * AU counts mirror SuperframeFilter::CheckSync() in dabplus_decoder.cpp:
+ *   dac_rate=1, sbr=1 → 3 AUs   dac_rate=1, sbr=0 → 6 AUs
+ *   dac_rate=0, sbr=1 → 2 AUs   dac_rate=0, sbr=0 → 4 AUs
  */
 
 class AdtsObserver : public SubchannelSinkObserver, public UntouchedStreamConsumer {
@@ -177,88 +180,62 @@ private:
     // Silence frame state — populated by FormatChange()
     bool                 m_silence_ready = false;
     int                  m_num_aus       = 3;
-    std::vector<uint8_t> m_silence_latm;
+    std::vector<uint8_t> m_silence_adts;
 
-    /* Build a minimal LATM/LOAS silence frame matching the current stream format.
-     * The frame carries a 4-byte null AAC payload which every decoder accepts
-     * as zero-energy audio, but ffmpeg with -c copy passes through without
-     * decoding, so only the LATM framing parameters matter for PTS accounting. */
-    void buildSilenceLatm(bool sbr, bool dac_rate, bool stereo) {
-        // Derive SuperframeFormat fields from AUDIO_SERVICE_FORMAT
+    /* Build a minimal ADTS silence frame matching the current stream format.
+     *
+     * The ADTS SR field carries the core (pre-SBR) sample rate index so that
+     * ffmpeg computes PTS using the core rate, matching ProcessUntouchedStream.
+     * For HE-AAC: core_sr_idx=6 (24kHz) for dac_rate=1, 8 (16kHz) for dac_rate=0.
+     *
+     * Payload is a bare ID_END element (0x0B 0xC0) — the smallest syntactically
+     * valid AAC raw_data_block, accepted as zero-energy audio by all decoders. */
+    void buildSilenceAdts(bool sbr, bool dac_rate, bool stereo) {
+        // Core SR index — matches GetCoreSrIndex() in dabplus_decoder.cpp
+        // HE-AAC (sbr=1): core is half the output rate
+        // AAC-LC (sbr=0): core SR equals the output rate
         int core_sr_idx = dac_rate ? (sbr ? 6 : 3) : (sbr ? 8 : 5);
-        int ext_sr_idx  = dac_rate ? 3 : 5;
         int ch_cfg      = stereo ? 2 : 1;
 
-        // Number of AUs per superframe (from ETSI TS 102 563)
-        // dacRate=1,sbr=1 → 3  |  dacRate=1,sbr=0 → 5
-        // dacRate=0,sbr=1 → 4  |  dacRate=0,sbr=0 → 5
-        m_num_aus = dac_rate ? (sbr ? 3 : 5) : (sbr ? 4 : 5);
+        // AU count — mirrors SuperframeFilter::CheckSync() exactly
+        m_num_aus = dac_rate ? (sbr ? 3 : 6) : (sbr ? 2 : 4);
 
-        const uint8_t null_au[4] = {};
+        // Minimal valid AAC frame: ID_END element + byte-align padding
+        const uint8_t null_au[]  = { 0x0B, 0xC0 };
         const size_t  au_len     = sizeof(null_au);
+        const size_t  frame_len  = 7 + au_len;
 
-        BitWriter bw;
-        bw.Reset();
+        m_silence_adts.resize(frame_len);
+        uint8_t* h = m_silence_adts.data();
 
-        // LOAS AudioSyncStream header
-        bw.AddBits(0x2B7, 11);   // syncword
-        bw.AddBits(0, 13);        // audioMuxLengthBytes (patched below)
+        h[0] = 0xFF;
+        h[1] = 0xF1;  // MPEG-4, layer=0, no CRC
+        h[2] = (0x01 << 6)               // profile = AAC-LC (profile_ObjectType = AOT-1)
+              | (core_sr_idx << 2)        // sampling_frequency_index = core rate
+              | ((ch_cfg >> 2) & 0x01);   // channel_configuration high bit
+        h[3] = ((ch_cfg & 0x03) << 6)    // channel_configuration low bits
+              | ((frame_len >> 11) & 0x03);
+        h[4] = (frame_len >> 3) & 0xFF;
+        h[5] = ((frame_len & 0x07) << 5) | 0x1F;  // buffer_fullness = 0x7FF (VBR)
+        h[6] = 0xFC;                               // number_of_raw_data_blocks_in_frame = 0 (1 block)
+        memcpy(h + 7, null_au, au_len);
 
-        // AudioMuxElement
-        bw.AddBits(0, 1);         // useSameStreamMux = 0 (always send StreamMuxConfig)
-
-        // StreamMuxConfig
-        bw.AddBits(0, 1);         // audioMuxVersion = 0
-        bw.AddBits(1, 1);         // allStreamsSameTimeFraming
-        bw.AddBits(0, 6);         // numSubFrames = 0
-        bw.AddBits(0, 4);         // numProgram = 0
-        bw.AddBits(0, 3);         // numLayer = 0
-
-        // AudioSpecificConfig (GASpecificConfig always 0b100 = 960-frame for DAB+)
-        if (sbr) {
-            bw.AddBits(5, 5);              // audioObjectType = SBR
-            bw.AddBits(core_sr_idx, 4);    // samplingFrequencyIndex (core)
-            bw.AddBits(ch_cfg, 4);         // channelConfiguration
-            bw.AddBits(ext_sr_idx, 4);     // extensionSamplingFrequencyIndex
-            bw.AddBits(2, 5);              // audioObjectType = AAC-LC
-            bw.AddBits(4, 3);              // GASpecificConfig: 960-frame
-        } else {
-            bw.AddBits(2, 5);              // audioObjectType = AAC-LC
-            bw.AddBits(core_sr_idx, 4);
-            bw.AddBits(ch_cfg, 4);
-            bw.AddBits(4, 3);              // GASpecificConfig: 960-frame
-        }
-
-        bw.AddBits(0, 3);         // frameLengthType = 0 (variable)
-        bw.AddBits(0xFF, 8);      // latmBufferFullness = 0xFF (VBR)
-        bw.AddBits(0, 1);         // otherDataPresent = 0
-        bw.AddBits(0, 1);         // crcCheckPresent = 0
-
-        // PayloadLengthInfo
-        for (size_t i = 0; i < au_len / 255; i++) bw.AddBits(0xFF, 8);
-        bw.AddBits((int)(au_len % 255), 8);
-
-        // PayloadMux (null bytes = silence)
-        bw.AddBytes(null_au, au_len);
-
-        bw.WriteAudioMuxLengthBytes();
-        m_silence_latm  = bw.GetData();
         m_silence_ready = true;
 
-        fprintf(stderr, "[dab_aac] Silence LATM: %zu bytes/frame × %d AUs/superframe "
-                "(core_sr_idx=%d ext_sr_idx=%d ch=%d)\n",
-                m_silence_latm.size(), m_num_aus, core_sr_idx, ext_sr_idx, ch_cfg);
+        fprintf(stderr, "[dab_aac] Silence ADTS: %zu bytes/frame × %d AUs/superframe "
+                "(core_sr_idx=%d ch=%d)\n",
+                frame_len, m_num_aus, core_sr_idx, ch_cfg);
     }
 
 public:
     AdtsObserver(PADDecoder* pad_decoder = nullptr)
         : m_pad_decoder(pad_decoder) {}
 
-    /* Called by MscToSuperframe during phase-loss re-scan to keep timing aligned. */
+    /* Called on each uncorrectable superframe to keep ffmpeg's PTS aligned. */
     void writeSilenceSuperframe() {
         if (!m_silence_ready) return;
         for (int i = 0; i < m_num_aus; i++)
-            fwrite(m_silence_latm.data(), 1, m_silence_latm.size(), stdout);
+            fwrite(m_silence_adts.data(), 1, m_silence_adts.size(), stdout);
         fflush(stdout);
     }
 
@@ -268,7 +245,7 @@ public:
         bool sbr      = (fmt.codec.find("HE-AAC") != std::string::npos);
         bool dac_rate = (fmt.samplerate_khz == 48);
         bool stereo   = (fmt.mode.find("Stereo") != std::string::npos);
-        buildSilenceLatm(sbr, dac_rate, stereo);
+        buildSilenceAdts(sbr, dac_rate, stereo);
     }
 
     void AudioError(const std::string& hint) override {
@@ -281,7 +258,7 @@ public:
     void FECInfo(int c, bool uncorr) override {
         if (uncorr) {
             fprintf(stderr, "[dab_aac] FEC: %d corrections, uncorrectable errors\n", c);
-            /* Write silence to fill the gap this failed superframe creates,
+            /* Write ADTS silence to fill the gap this failed superframe creates,
              * keeping ffmpeg's PTS counter aligned with real time. */
             writeSilenceSuperframe();
             if (g_on_fec_failure) g_on_fec_failure();
@@ -438,12 +415,12 @@ int main(int argc, char *argv[]) {
 
     if (!sls_dir.empty()) {
         fprintf(stderr, "[dab_aac] SLS Extraction enabled. Saving to: %s\n", sls_dir.c_str());
-        
+
         sls_extractor = new SlsExtractor(sls_dir);
         pad_decoder = new PADDecoder(sls_extractor, false); // 'false' for strict X-PAD length checking
-        
+
         // CRITICAL: We must explicitly tell the PADDecoder the User Application Type for MOT.
-        // In the DAB standard, 12 is the type for MOT Slideshows. Without the FIC decoder running 
+        // In the DAB standard, 12 is the type for MOT Slideshows. Without the FIC decoder running
         // to assign this dynamically, we have to force it.
         pad_decoder->SetMOTAppType(12);
     }
@@ -475,6 +452,6 @@ int main(int argc, char *argv[]) {
     delete tuner;
     delete pad_decoder;
     delete sls_extractor;
-    
+
     return 0;
 }
