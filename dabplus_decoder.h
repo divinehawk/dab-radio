@@ -24,6 +24,8 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <thread>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 
@@ -35,9 +37,23 @@
 
 class SlsExtractor : public PADDecoderObserver {
 public:
-    // tuner may be nullptr; if provided, signal info is written to metadata.json
+    // tuner may be nullptr; if provided, signal.json is written every 5 seconds
+    // independently of metadata.json.
     SlsExtractor(const std::string& output_dir, RaonTunerInput* tuner = nullptr)
-        : m_output_dir(output_dir), m_tuner(tuner) {}
+        : m_output_dir(output_dir), m_tuner(tuner)
+    {
+        if (m_tuner) {
+            m_signal_thread_run = true;
+            m_signal_thread = std::thread(&SlsExtractor::signalPollLoop, this);
+        }
+    }
+
+    ~SlsExtractor() {
+        if (m_signal_thread.joinable()) {
+            m_signal_thread_run = false;
+            m_signal_thread.join();
+        }
+    }
 
     void PADChangeSlide(const MOT_FILE& slide) override {
         if (m_output_dir.empty()) return;
@@ -67,12 +83,6 @@ public:
         std::string label = CharsetTools::ConvertTextToUTF8(
             dl.raw.data(), dl.raw.size(), dl.charset, false, nullptr);
 
-        // Snapshot signal quality at the moment DLS changes
-        RaonTunerInput::SignalInfo sig{};
-        bool have_signal = (m_tuner != nullptr);
-        if (have_signal)
-            sig = m_tuner->getSignalInfo();
-
         std::ofstream json_file(m_output_dir + "/metadata.json");
         if (json_file.is_open()) {
             json_file << "{\n";
@@ -87,29 +97,48 @@ public:
                 json_file << "      \"value\": \"" << obj.text << "\"\n";
                 json_file << "    }" << (i == dl.dl_plus_objects.size() - 1 ? "" : ",") << "\n";
             }
-            json_file << "  ]";
-            if (have_signal) {
-                json_file << ",\n";
-                json_file << "  \"signal\": {\n";
-                json_file << "    \"antenna_level\": " << +sig.antennaLevel << ",\n";
-                json_file << "    \"cer\": "           << sig.cer           << ",\n";
-                json_file << "    \"locked\": "        << (sig.locked ? "true" : "false") << "\n";
-                json_file << "  }";
-            }
-            json_file << "\n}\n";
+            json_file << "  ]\n}\n";
         }
 
         fprintf(stderr, "[dabplus] DLS: %s\n", label.c_str());
-        if (have_signal)
-            fprintf(stderr, "[dabplus] Signal: level=%d cer=%u locked=%s\n",
-                    sig.antennaLevel, sig.cer, sig.locked ? "yes" : "no");
     }
 
     void PADFileProgress(const double /*fraction*/) override {}
 
 private:
-    std::string      m_output_dir;
-    RaonTunerInput*  m_tuner;
+    void signalPollLoop() {
+        const std::string signal_path = m_output_dir + "/signal.json";
+        const std::string tmp_path    = signal_path + ".tmp";
+
+        while (m_signal_thread_run) {
+            RaonTunerInput::SignalInfo sig = m_tuner->getSignalInfo();
+
+            // Write to a temp file then rename so readers never see a partial file
+            {
+                std::ofstream f(tmp_path);
+                if (f.is_open()) {
+                    f << "{\n";
+                    f << "  \"antenna_level\": " << +sig.antennaLevel << ",\n";
+                    f << "  \"cer\": "            << sig.cer           << ",\n";
+                    f << "  \"locked\": "         << (sig.locked ? "true" : "false") << "\n";
+                    f << "}\n";
+                }
+            }
+            std::rename(tmp_path.c_str(), signal_path.c_str());
+
+            fprintf(stderr, "[dabplus] Signal: level=%d cer=%u locked=%s\n",
+                    sig.antennaLevel, sig.cer, sig.locked ? "yes" : "no");
+
+            // Sleep in 100 ms increments so the destructor wakes us promptly
+            for (int i = 0; i < 50 && m_signal_thread_run; i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    std::string          m_output_dir;
+    RaonTunerInput*      m_tuner;
+    std::thread          m_signal_thread;
+    std::atomic<bool>    m_signal_thread_run{false};
 };
 
 /* ── Decoder ─────────────────────────────────────────────────────────────── */
@@ -125,7 +154,7 @@ public:
 
     // Enable SLS/DLS metadata extraction; call before feeding data.
     // output_dir: directory to write cover.jpg/png and metadata.json into.
-    // tuner: if provided, signal strength is included in metadata.json.
+    // tuner: if provided, signal.json is written every 5 seconds independently.
     void enableSLS(const std::string& output_dir, RaonTunerInput* tuner = nullptr);
 
 private:
