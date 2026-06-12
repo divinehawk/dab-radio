@@ -24,10 +24,95 @@
 #include <vector>
 #include <string>
 #include <atomic>
-
+#include <fstream>
 #include <iostream>
 
+#include "pad_decoder.h"
+#include "tools.h"
+#include "raon_tuner.h"
 
+/* ── SLS / DLS observer ─────────────────────────────────────────────────── */
+
+class SlsExtractor : public PADDecoderObserver {
+public:
+    // tuner may be nullptr; if provided, signal info is written to metadata.json
+    SlsExtractor(const std::string& output_dir, RaonTunerInput* tuner = nullptr)
+        : m_output_dir(output_dir), m_tuner(tuner) {}
+
+    void PADChangeSlide(const MOT_FILE& slide) override {
+        if (m_output_dir.empty()) return;
+
+        fprintf(stderr, "[dabplus] Image received: %s\n", slide.content_name.c_str());
+        fprintf(stderr, "[dabplus] Category: %s\n", slide.category_title.c_str());
+        fprintf(stderr, "[dabplus] Click URL: %s\n", slide.click_through_url.c_str());
+
+        std::string filename = "cover";
+        if      (slide.content_sub_type == MOT_FILE::CONTENT_SUB_TYPE_JFIF) filename += ".jpg";
+        else if (slide.content_sub_type == MOT_FILE::CONTENT_SUB_TYPE_PNG)  filename += ".png";
+
+        for (char& c : filename)
+            if (c == '/' || c == '\\') c = '_';
+
+        std::string filepath = m_output_dir + "/" + filename;
+        std::ofstream out(filepath, std::ios::binary);
+        if (out) {
+            out.write(reinterpret_cast<const char*>(slide.data.data()), slide.data.size());
+            fprintf(stderr, "[dabplus] Saved MOT slide: %s (%zu bytes)\n", filepath.c_str(), slide.data.size());
+        } else {
+            fprintf(stderr, "[dabplus] Failed to save MOT slide: %s\n", filepath.c_str());
+        }
+    }
+
+    void PADChangeDynamicLabel(const DL_STATE& dl) override {
+        std::string label = CharsetTools::ConvertTextToUTF8(
+            dl.raw.data(), dl.raw.size(), dl.charset, false, nullptr);
+
+        // Snapshot signal quality at the moment DLS changes
+        RaonTunerInput::SignalInfo sig{};
+        bool have_signal = (m_tuner != nullptr);
+        if (have_signal)
+            sig = m_tuner->getSignalInfo();
+
+        std::ofstream json_file(m_output_dir + "/metadata.json");
+        if (json_file.is_open()) {
+            json_file << "{\n";
+            json_file << "  \"dls\": \"" << label << "\",\n";
+            json_file << "  \"dl_plus\": [\n";
+            for (size_t i = 0; i < dl.dl_plus_objects.size(); ++i) {
+                const auto& obj = dl.dl_plus_objects[i];
+                json_file << "    {\n";
+                json_file << "      \"tag\": \""
+                          << DynamicLabelDecoder::ConvertDLPlusContentTypeToString(obj.content_type)
+                          << "\",\n";
+                json_file << "      \"value\": \"" << obj.text << "\"\n";
+                json_file << "    }" << (i == dl.dl_plus_objects.size() - 1 ? "" : ",") << "\n";
+            }
+            json_file << "  ]";
+            if (have_signal) {
+                json_file << ",\n";
+                json_file << "  \"signal\": {\n";
+                json_file << "    \"antenna_level\": " << +sig.antennaLevel << ",\n";
+                json_file << "    \"cer\": "           << sig.cer           << ",\n";
+                json_file << "    \"locked\": "        << (sig.locked ? "true" : "false") << "\n";
+                json_file << "  }";
+            }
+            json_file << "\n}\n";
+        }
+
+        fprintf(stderr, "[dabplus] DLS: %s\n", label.c_str());
+        if (have_signal)
+            fprintf(stderr, "[dabplus] Signal: level=%d cer=%u locked=%s\n",
+                    sig.antennaLevel, sig.cer, sig.locked ? "yes" : "no");
+    }
+
+    void PADFileProgress(const double /*fraction*/) override {}
+
+private:
+    std::string      m_output_dir;
+    RaonTunerInput*  m_tuner;
+};
+
+/* ── Decoder ─────────────────────────────────────────────────────────────── */
 
 class DabPlusServiceComponentDecoder {
 
@@ -38,14 +123,23 @@ public:
     virtual void setSubchannelBitrate(uint16_t bitrate);
     virtual void componentDataInput(const std::vector<uint8_t>& frameData, bool synchronized);
 
-    //special case for MscStreamAudio
-    // using PAD_DATA_CALLBACK = std::function<void (const std::vector<uint8_t>&)>;
-    // virtual std::shared_ptr<PAD_DATA_CALLBACK> registerPadDataCallback(PAD_DATA_CALLBACK cb);
-
-    // using AUDIO_COMPONENT_DATA_CALLBACK = std::function<void(const std::vector<uint8_t>&, int, int, int, bool, bool)>;
-    // virtual std::shared_ptr<AUDIO_COMPONENT_DATA_CALLBACK> registerAudioDataCallback(AUDIO_COMPONENT_DATA_CALLBACK cb);
+    // Enable SLS/DLS metadata extraction; call before feeding data.
+    // output_dir: directory to write cover.jpg/png and metadata.json into.
+    // tuner: if provided, signal strength is included in metadata.json.
+    void enableSLS(const std::string& output_dir, RaonTunerInput* tuner = nullptr);
 
 private:
+    // Audio format derived from the DAB+ superframe header.
+    // Carried into ProcessUntouchedStream() so the LATM AudioSpecificConfig
+    // reflects the actual stream rather than hardcoded assumptions.
+    struct AUFormat {
+        bool sbr{false};
+        bool ps{false};
+        int  coreSrIndex{8};  // ISO 14496-3 sampling frequency index for AAC core
+        int  extSrIndex{5};   // sampling frequency index for SBR output rate
+        int  chanConfig{1};   // 1 = mono, 2 = stereo
+    };
+
     struct DabSuperFrame {
         std::vector<uint8_t> superFrameData;
         uint8_t numAUs{0};
@@ -55,7 +149,18 @@ private:
         bool psUsed{false};
         int samplingRate{-1};
         int channels{-1};
-        void clear() {superFrameData.clear(); numAUs = 0; auLengths.clear(); auStarts.clear(); sbrUsed = false; psUsed = false; samplingRate = -1; channels = -1;}
+        AUFormat auFormat;
+        void clear() {
+            superFrameData.clear();
+            numAUs = 0;
+            auLengths.clear();
+            auStarts.clear();
+            sbrUsed = false;
+            psUsed = false;
+            samplingRate = -1;
+            channels = -1;
+            auFormat = AUFormat{};
+        }
     };
 
 private:
@@ -83,22 +188,19 @@ private:
     uint16_t m_frameSize{0};
     uint16_t m_superFrameSize{0};
 
-    // ConcurrentQueue <std::vector<uint8_t>> m_conQueue;
-    // CallbackDispatcher<std::function<void (const std::vector<uint8_t>&)>> m_padDataDispatcher;
-    // CallbackDispatcher<AUDIO_COMPONENT_DATA_CALLBACK> m_audioDataDispatcher;
-
-    // std::atomic<bool> m_processThreadRunning{false};
-    // std::thread m_processThread;
-
     std::vector<uint8_t> m_unsyncDataBuffer;
     bool m_unsyncSync{false};
     int m_unsyncFrameCount{0};
 
+    // PAD/SLS members — null when SLS is not enabled
+    SlsExtractor* m_slsExtractor{nullptr};
+    PADDecoder*   m_padDecoder{nullptr};
+
 private:
     void processData(const std::vector<uint8_t>& frameData);
-
-    void ProcessUntouchedStream(const uint8_t *data, size_t len);
+    void ProcessUntouchedStream(const uint8_t *data, size_t len, const AUFormat& fmt);
     void synchronizeData(const std::vector<uint8_t>& unsyncData);
+    void dispatchPAD(const std::vector<uint8_t>& padData);
 
 private:
     static const uint16_t FIRECODE_TABLE[256];
@@ -158,7 +260,6 @@ static const uint16_t CRC_CCITT_TABLE[256] = {
 };
 
 static inline bool CRC_CCITT_CHECK(const uint8_t* data, uint16_t dataLen) {
-    //initial register all 1
     if(dataLen < 2) {
         return false;
     }
