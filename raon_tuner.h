@@ -60,6 +60,16 @@ public:
 
     std::string getDeviceName() const;
 
+    struct SignalInfo {
+        uint8_t  antennaLevel;  // 0 (no signal) – 6 (best)
+        uint32_t cer;           // Channel Error Rate × 10000; 0 = perfect, 2000 = no signal
+        bool     locked;        // true if both OFDM and FEC are locked
+    };
+
+    // Read current signal quality from the chip registers.
+    // Safe to call from any thread that isn't concurrently in readData().
+    SignalInfo getSignalInfo();
+
 private:
     const std::string LOG_TAG{"[RaonUsbTuner] "};
     constexpr static uint8_t MAXIMUM_CONCURRENT_SUBCHANNELS{1};

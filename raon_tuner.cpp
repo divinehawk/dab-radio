@@ -863,6 +863,56 @@ void RaonTunerInput::clearAndSetupMscMemory() {
     setRegister(0x48, 0x05);
 }
 
+RaonTunerInput::SignalInfo RaonTunerInput::getSignalInfo() {
+    SignalInfo info{0, 2000, false};
+
+    switchPage(REGISTER_PAGE_DD);
+
+    // OFDM lock (reg 0x37 bit 0) + FEC lock (reg 0xFB bits [1:0])
+    bool ofdm_lock = (readRegister(0x37) & 0x01) != 0;
+    bool fec_lock  = (readRegister(0xFB) & 0x03) == 0x03;
+    info.locked = ofdm_lock && fec_lock;
+
+    if (!ofdm_lock) {
+        // No lock — return worst-case values
+        return info;
+    }
+
+    // Read CER period counter (regs 0x88–0x8B)
+    uint8_t rcnt3 = readRegister(0x88);
+    uint8_t rcnt2 = readRegister(0x89);
+    uint8_t rcnt1 = readRegister(0x8A);
+    uint8_t rcnt0 = readRegister(0x8B);
+    uint32_t cer_period_cnt = (rcnt3 << 24) | (rcnt2 << 16) | (rcnt1 << 8) | rcnt0;
+
+    // Read CER error counter (regs 0x8C–0x8F)
+    rcnt3 = readRegister(0x8C);
+    rcnt2 = readRegister(0x8D);
+    rcnt1 = readRegister(0x8E);
+    rcnt0 = readRegister(0x8F);
+    uint32_t cer_cnt = (rcnt3 << 24) | (rcnt2 << 16) | (rcnt1 << 8) | rcnt0;
+
+    if (cer_period_cnt != 0) {
+        if (cer_cnt <= 4000) {
+            info.cer = 0;
+        } else {
+            info.cer = ((cer_cnt * 1000) / cer_period_cnt) * 10;
+            if (info.cer > 1200)
+                info.cer = 2000;
+        }
+    }
+
+    // Map CER to 0–6 antenna level using the same table as getAntennaLevel()
+    uint8_t level = 0;
+    do {
+        if (info.cer >= AntLvlTbl[level])
+            break;
+    } while (++level != DAB_MAX_NUM_ANTENNA_LEVEL);
+    info.antennaLevel = level;
+
+    return info;
+}
+
 void RaonTunerInput::getAntennaLevel() {
     bool lock_stat{false};
     uint8_t rcnt3{0}, rcnt2{0}, rcnt1{0}, rcnt0{0};
